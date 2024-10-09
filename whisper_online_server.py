@@ -118,26 +118,19 @@ class ServerProcessor:
         self.is_first = False
         return np.concatenate(out)
 
-    def format_output_transcript(self,o):
-        # output format in stdout is like:
-        # 0 1720 Takhle to je
-        # - the first two words are:
-        #    - beg and end timestamp of the text segment, as estimated by Whisper model. The timestamps are not accurate, but they're useful anyway
-        # - the next words: segment transcript
-
-        # This function differs from whisper_online.output_transcript in the following:
-        # succeeding [beg,end] intervals are not overlapping because ELITR protocol (implemented in online-text-flow events) requires it.
-        # Therefore, beg, is max of previous end and current beg outputed by Whisper.
-        # Usually it differs negligibly, by appx 20 ms.
-
+    def format_output_transcript(self, o):
         if o[0] is not None:
-            beg, end = o[0]*1000,o[1]*1000
+            beg, end = o[0]*1000, o[1]*1000
             if self.last_end is not None:
                 beg = max(beg, self.last_end)
 
             self.last_end = end
-            print("%1.0f %1.0f %s" % (beg,end,o[2]),flush=True,file=sys.stderr)
-            return "%1.0f %1.0f %s" % (beg,end,o[2])
+            
+            # Split the text into prompt and sentence
+            prompt, sentence = o[2].split('\n', 1)
+            
+            print(f"{prompt}\n{beg:.0f} {end:.0f} {sentence}", flush=True, file=sys.stderr)
+            return f"{prompt}\n{beg:.0f} {end:.0f} {sentence}"
         else:
             logger.debug("No text in this segment")
             return None

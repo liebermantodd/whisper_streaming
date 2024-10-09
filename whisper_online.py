@@ -313,23 +313,23 @@ class HypothesisBuffer:
         return self.buffer
 
 class OnlineASRProcessor:
-
     SAMPLING_RATE = 16000
 
-    def __init__(self, asr, tokenizer=None, buffer_trimming=("segment", 15), logfile=sys.stderr):
-        """asr: WhisperASR object
-        tokenizer: sentence tokenizer object for the target language. Must have a method *split* that behaves like the one of MosesTokenizer. It can be None, if "segment" buffer trimming option is used, then tokenizer is not used at all.
-        ("segment", 15)
-        buffer_trimming: a pair of (option, seconds), where option is either "sentence" or "segment", and seconds is a number. Buffer is trimmed if it is longer than "seconds" threshold. Default is the most recommended option.
-        logfile: where to store the log. 
-        """
+    def __init__(self, asr, min_chunk_size=1):
         self.asr = asr
-        self.tokenizer = tokenizer
+        self.logfile = sys.stderr
+        self.min_chunk_size = min_chunk_size
+        self.buffer_trimming = ("none", 1.0)  # Default values
+        self.init()
+        self.current_sentence = ""
+        self.sentence_end_punctuation = {'.', '!', '?'}
+        self.current_prompt = ""
+
+    def set_logfile(self, logfile):
         self.logfile = logfile
 
-        self.init()
-
-        self.buffer_trimming_way, self.buffer_trimming_sec = buffer_trimming
+    def set_buffer_trimming(self, option, seconds):
+        self.buffer_trimming = (option, seconds)
 
     def init(self, offset=None):
         """run this when starting or restarting processing"""
@@ -345,74 +345,53 @@ class OnlineASRProcessor:
         self.audio_buffer = np.append(self.audio_buffer, audio)
 
     def prompt(self):
-        """Returns a tuple: (prompt, context), where "prompt" is a 200-character suffix of commited text that is inside of the scrolled away part of audio buffer. 
-        "context" is the commited text that is inside the audio buffer. It is transcribed again and skipped. It is returned only for debugging and logging reasons.
-        """
-        k = max(0,len(self.commited)-1)
-        while k > 0 and self.commited[k-1][1] > self.buffer_time_offset:
-            k -= 1
-
-        p = self.commited[:k]
-        p = [t for _,_,t in p]
-        prompt = []
-        l = 0
-        while p and l < 200:  # 200 characters prompt size
-            x = p.pop(-1)
-            l += len(x)+1
-            prompt.append(x)
-        non_prompt = self.commited[k:]
-        return self.asr.sep.join(prompt[::-1]), self.asr.sep.join(t for _,_,t in non_prompt)
+        # Generate a prompt based on the current context
+        context = " ".join([item[2] for item in self.commited[-5:]])  # Use last 5 committed segments
+        self.current_prompt = f"Transcribe the following audio. Previous context: {context}"
+        return self.current_prompt, context
 
     def process_iter(self):
-        """Runs on the current audio buffer.
-        Returns: a tuple (beg_timestamp, end_timestamp, "text"), or (None, None, ""). 
-        The non-emty text is confirmed (committed) partial transcript.
-        """
-
-        prompt, non_prompt = self.prompt()
+        prompt, context = self.prompt()
         logger.debug(f"PROMPT: {prompt}")
-        logger.debug(f"CONTEXT: {non_prompt}")
+        logger.debug(f"CONTEXT: {context}")
         logger.debug(f"transcribing {len(self.audio_buffer)/self.SAMPLING_RATE:2.2f} seconds from {self.buffer_time_offset:2.2f}")
         res = self.asr.transcribe(self.audio_buffer, init_prompt=prompt)
 
-        # transform to [(beg,end,"word1"), ...]
         tsw = self.asr.ts_words(res)
-
         self.transcript_buffer.insert(tsw, self.buffer_time_offset)
         o = self.transcript_buffer.flush()
         self.commited.extend(o)
-        completed = self.to_flush(o)
-        logger.debug(f">>>>COMPLETE NOW: {completed}")
-        the_rest = self.to_flush(self.transcript_buffer.complete())
-        logger.debug(f"INCOMPLETE: {the_rest}")
 
-        # there is a newly confirmed text
+        # Process the new text and accumulate sentences
+        new_text = self.to_flush(o)[2]
+        sentences = self.accumulate_sentences(new_text)
 
-        if o and self.buffer_trimming_way == "sentence":  # trim the completed sentences
-            if len(self.audio_buffer)/self.SAMPLING_RATE > self.buffer_trimming_sec:  # longer than this
-                self.chunk_completed_sentence()
+        # Add prompt to each sentence
+        sentences_with_prompt = []
+        for sentence in sentences:
+            sentences_with_prompt.append((sentence[0], sentence[1], f"PROMPT: {prompt}\n{sentence[2]}"))
 
-        
-        if self.buffer_trimming_way == "segment":
-            s = self.buffer_trimming_sec  # trim the completed segments longer than s,
-        else:
-            s = 30 # if the audio buffer is longer than 30s, trim it
-        
-        if len(self.audio_buffer)/self.SAMPLING_RATE > s:
-            self.chunk_completed_segment(res)
+        return sentences_with_prompt
 
-            # alternative: on any word
-            #l = self.buffer_time_offset + len(self.audio_buffer)/self.SAMPLING_RATE - 10
-            # let's find commited word that is less
-            #k = len(self.commited)-1
-            #while k>0 and self.commited[k][1] > l:
-            #    k -= 1
-            #t = self.commited[k][1] 
-            logger.debug("chunking segment")
-            #self.chunk_at(t)
+    def accumulate_sentences(self, new_text):
+        sentences = []
+        self.current_sentence += new_text
 
-        logger.debug(f"len of buffer now: {len(self.audio_buffer)/self.SAMPLING_RATE:2.2f}")
-        return self.to_flush(o)
+        while True:
+            sentence_end = -1
+            for punct in self.sentence_end_punctuation:
+                end = self.current_sentence.find(punct)
+                if end != -1 and (sentence_end == -1 or end < sentence_end):
+                    sentence_end = end
+
+            if sentence_end == -1:
+                break
+
+            sentence = self.current_sentence[:sentence_end + 1].strip()
+            sentences.append((None, None, sentence))  # Using None for start/end times as we don't have precise timings
+            self.current_sentence = self.current_sentence[sentence_end + 1:].strip()
+
+        return sentences
 
     def chunk_completed_sentence(self):
         if self.commited == []: return
@@ -490,14 +469,15 @@ class OnlineASRProcessor:
         return out
 
     def finish(self):
-        """Flush the incomplete text when the whole processing ends.
-        Returns: the same format as self.process_iter()
-        """
         o = self.transcript_buffer.complete()
         f = self.to_flush(o)
         logger.debug(f"last, noncommited: {f}")
         self.buffer_time_offset += len(self.audio_buffer)/16000
-        return f
+
+        # Add any remaining text as a sentence
+        if self.current_sentence:
+            return [(None, None, self.current_sentence.strip())]
+        return []
 
 
     def to_flush(self, sents, sep=None, offset=0, ):
@@ -703,10 +683,17 @@ def asr_factory(args, logfile=sys.stderr):
 
     # Create the OnlineASRProcessor
     if args.vac:
-        
-        online = VACOnlineASRProcessor(args.min_chunk_size, asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+        online = VACOnlineASRProcessor(args.min_chunk_size, asr)
     else:
-        online = OnlineASRProcessor(asr,tokenizer,logfile=logfile,buffer_trimming=(args.buffer_trimming, args.buffer_trimming_sec))
+        online = OnlineASRProcessor(asr, min_chunk_size=args.min_chunk_size)
+
+    # Set logfile if needed (assuming there's a method to set it)
+    if hasattr(online, 'set_logfile'):
+        online.set_logfile(logfile)
+
+    # Set buffer trimming if needed (assuming there's a method to set it)
+    if hasattr(online, 'set_buffer_trimming'):
+        online.set_buffer_trimming(args.buffer_trimming, args.buffer_trimming_sec)
 
     return asr, online
 
